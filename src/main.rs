@@ -2,19 +2,13 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use http_body_util::Full;
-use hyper::body::Bytes;
+use hyper::body::{Body, Bytes};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use build_html::*;
-use hyper_router::*;
-
-
-async fn add(request: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-
-}
 
 async fn hello(request: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     Ok(Response::new(
@@ -33,6 +27,20 @@ async fn hello(request: Request<hyper::body::Incoming>) -> Result<Response<Full<
                 .to_html_string()
         ))
     ))
+}
+
+async fn router(request: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    let path: Vec<&str> = request.uri().path().split("/").collect();
+
+    match path[1] {
+        "add" => {
+            todo!()
+        },
+        "hello" => hello(request).await,
+        _ => {
+            todo!("404")
+        }
+    }
 }
 
 #[tokio::main]
@@ -55,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Finally, we bind the incoming connection to our `hello` service
             if let Err(err) = http1::Builder::new()
                 // `service_fn` converts our function in a `Service`
-                .serve_connection(io, service_fn(hello))
+                .serve_connection(io, service_fn(router))
                 .await
             {
                 println!("Error serving connection: {:?}", err);
