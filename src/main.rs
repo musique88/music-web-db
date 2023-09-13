@@ -8,25 +8,18 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, Method, StatusCode};
 use hyper_util::rt::TokioIo;
-use musicbrainz_rs::entity::artist_credit::ArtistCredit;
-use sqlx::Database;
 use tokio::net::TcpListener;
 use build_html::*;
 
 use musicbrainz_rs::prelude::*;
 use musicbrainz_rs::entity::release_group::*; use sqlx::{SqlitePool, pool::PoolConnection, Sqlite};
 
-trait Query {
-    fn to_tree() -> BTreeMap<String, String>;
-    fn to_string() -> String;
-}
-
-fn query_to_map(query: &str) -> BTreeMap<&str, &str> {
+fn query_to_map(query: &str) -> BTreeMap<String, String> {
     let splits: Vec<&str> = query.split("&").collect();
     let mut map = BTreeMap::new();
     for s in splits {
         let kvpair: Vec<&str> = s.split("=").collect();
-        map.insert(kvpair[0], kvpair[1]);
+        map.insert(kvpair[0].to_string(), kvpair[1].to_string());
     }
     map
 }
@@ -38,6 +31,89 @@ fn map_to_query(map: &BTreeMap<&str, &str>) -> String {
     }
     s.pop();
     s
+}
+
+fn url_decode(url: &String) -> String {
+    String::from(urlencoding::decode(url).expect("UTF-8"))
+}
+
+fn url_encode(string: &String) -> String {
+    String::from(urlencoding::encode(string))
+}
+
+trait Query {
+    fn to_tree(&self) -> BTreeMap<String, String>;
+    fn to_string(&self) -> String;
+    fn from_query(query: &str) -> Option<Self> where Self: Sized;
+    fn from_map(map: BTreeMap<String, String>) -> Option<Self> where Self: Sized;
+}
+
+struct MidAdditionQuery {
+    name: String,
+    offset: i32,
+}
+
+impl Query for MidAdditionQuery {
+    fn to_tree(&self) -> BTreeMap<String, String> {
+        let mut map = BTreeMap::new();
+        map.insert("name".to_string(), self.name.clone());
+        if self.offset != 0 {
+            map.insert("offset".to_string(), self.offset.to_string());
+        }
+        map
+    }
+
+    fn to_string(&self) -> String {
+        if self.offset == 0 {
+            format!("name={}", url_encode(&self.name))
+        } else {
+            format!("name={}&offset={}", url_encode(&self.name), self.offset)
+        }
+    }
+
+    fn from_query(query: &str) -> Option<Self> where Self: Sized {
+        Self::from_map(query_to_map(query))
+    }
+
+    fn from_map(map: BTreeMap<String, String>) -> Option<Self> where Self: Sized {
+        if !map.contains_key("name") {
+            return None;
+        }
+        
+        Some(Self{
+            name: url_decode(&map["name"]), 
+            offset: if map.contains_key("offset") {map["offset"].parse::<i32>().unwrap()} else {0}})
+    }
+}
+
+struct FinalAddition {
+    name: String,
+    mbid: String,
+}
+
+impl Query for FinalAddition {
+    fn to_tree(&self) -> BTreeMap<String, String> {
+        let mut map = BTreeMap::new();
+        map.insert("name".to_string(), self.name.clone());
+        map.insert("mbid".to_string(), self.mbid.clone());
+        map
+    }
+
+    fn to_string(&self) -> String {
+        format!("name={}&mbid={}", url_encode(&self.name), url_encode(&self.mbid))
+    }
+
+    fn from_query(query: &str) -> Option<Self> where Self: Sized {
+        Self::from_map(query_to_map(query))
+    }
+
+    fn from_map(map: BTreeMap<String, String>) -> Option<Self> where Self: Sized {
+        if !map.contains_key("name") || !map.contains_key("mbid") {
+            return None;
+        }
+        
+        Some(Self{name: url_decode(&map["name"]), mbid: url_decode(&map["mbid"])})
+    }
 }
 
 fn simple_page_response(content: String) -> Result<Response<Full<Bytes>>, Infallible> {
@@ -55,13 +131,9 @@ fn simple_page_response(content: String) -> Result<Response<Full<Bytes>>, Infall
 }
 async fn mid_addition(request: Request<hyper::body::Incoming>) 
 -> Result<Response<Full<Bytes>>, Infallible> {
-    let map = query_to_map(request.uri().query().unwrap());
-    let offset: &str = match map.get("offset") {
-        Some(val) => val,
-        None => "0"
-    };
+    let query = MidAdditionQuery::from_query(request.uri().query().unwrap()).unwrap();
     let result_iterator: Vec<ReleaseGroup> = ReleaseGroup::search(
-        ReleaseGroupSearchQuery::query_builder().release_group(map["name"]).build() + &format!("&offset={}", offset).to_string()
+        ReleaseGroupSearchQuery::query_builder().release_group(&query.name).build() + &format!("&offset={}", query.offset).to_string()
     ).execute().await.unwrap().entities;
 
     let mut c = Container::new(ContainerType::Div);
@@ -72,15 +144,10 @@ async fn mid_addition(request: Request<hyper::body::Incoming>)
         c.add_raw("<br>");
     }
 
-    map.insert("offset", (offset.parse::<i32>().unwrap() + 25).to_string());
-    if map.contains_key("offset") {
-        let mut map = map.clone();
-        
-        c.add_link(format!("{}", request.uri().path_and_query().unwrap()), "Next");
+    if query.offset != 0 {
+        c.add_link(format!("/mid-addition?name={}&offset={}", query.name, query.offset - 25), "Prev");
     }
-    else {
-        c.add_link(format!("{}&offset={}", request.uri().path_and_query().unwrap(), 25), "Next");
-    }
+    c.add_link(format!("/mid-addition?name={}&offset={}", query.name, query.offset + 25), "Next");
 
     Ok(Response::new(
        Full::new(Bytes::from(
@@ -97,19 +164,14 @@ async fn mid_addition(request: Request<hyper::body::Incoming>)
 
 async fn add_final(request: Request<hyper::body::Incoming>, sql: &SqlitePool) 
 -> Result<Response<Full<Bytes>>, Infallible> {
-    let map = query_to_map(request.uri().query().unwrap());
-    
-    if !map.contains_key("name") || !map.contains_key("mbid") {
-        return simple_page_response("no name or mbid".to_string());
-    }
+    let query = FinalAddition::from_query(request.uri().query().unwrap()).unwrap();
 
     sqlx::query("insert into album values(NULL, ?, ?);")
-        .bind(urlencoding::decode(map["name"]).expect("UTF-8"))
-        .bind(map["mbid"])
+        .bind(query.name)
+        .bind(query.mbid)
         .execute(sql).await.unwrap();
     
     let val: Vec<(i32, String, String)> = sqlx::query_as("select * from album;")
-        .bind(query_to_map(request.uri().query().unwrap())["name"])
         .fetch_all(sql).await.unwrap();
 
     simple_page_response(format!("{:?}", val))
@@ -157,6 +219,23 @@ async fn hello(request: Request<hyper::body::Incoming>)
     ))
 }
 
+async fn image(request: Request<hyper::body::Incoming>)
+-> Result<Response<Full<Bytes>>, Infallible> {
+    let cover_art = ReleaseGroup::fetch().id(request.uri().query().unwrap()).execute().await.unwrap()
+        .get_coverart().execute().await.unwrap();
+
+    let cover_art = match cover_art {
+        musicbrainz_rs::entity::CoverartResponse::Json(c) => {
+            c.images[0].image.clone()
+        },
+        musicbrainz_rs::entity::CoverartResponse::Url(url) => {
+            url
+        }
+    };
+
+    Ok(Response::new(Full::new(reqwest::get(cover_art).await.unwrap().bytes().await.unwrap())))
+}
+
 async fn router(request: Request<hyper::body::Incoming>, sql: &SqlitePool) 
 -> Result<Response<Full<Bytes>>, Infallible> {
     let path: Vec<&str> = request.uri().path().split("/").collect();
@@ -164,6 +243,7 @@ async fn router(request: Request<hyper::body::Incoming>, sql: &SqlitePool)
         "add" => add(request).await,
         "mid-addition" => mid_addition(request).await,
         "add-final" => add_final(request, sql).await,
+        "image" => image(request).await,
         "hello" => hello(request).await,
         _ => {
             let mut res = Response::new(Full::new(Bytes::from("")));
