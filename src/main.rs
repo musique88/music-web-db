@@ -1,18 +1,22 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::io::{Read, prelude::*};
 use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use http_body_util::Full;
-use hyper::body::{Body, Bytes};
+use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response, Method, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use build_html::*;
 
 use musicbrainz_rs::prelude::*;
-use musicbrainz_rs::entity::release_group::*; use sqlx::{SqlitePool, pool::PoolConnection, Sqlite};
+use musicbrainz_rs::entity::release_group::*; 
+use sqlx::SqlitePool;
 
 fn query_to_map(query: &str) -> BTreeMap<String, String> {
     let splits: Vec<&str> = query.split("&").collect();
@@ -22,15 +26,6 @@ fn query_to_map(query: &str) -> BTreeMap<String, String> {
         map.insert(kvpair[0].to_string(), kvpair[1].to_string());
     }
     map
-}
-
-fn map_to_query(map: &BTreeMap<&str, &str>) -> String {
-    let mut s = String::from("");
-    for (key, value) in map {
-        s += format!("{}={}&", key, value).as_str();
-    }
-    s.pop();
-    s
 }
 
 fn url_decode(url: &String) -> String {
@@ -138,9 +133,7 @@ async fn mid_addition(request: Request<hyper::body::Incoming>)
 
     let mut c = Container::new(ContainerType::Div);
     for r in result_iterator {
-        c.add_link(format!("/add-final?name={}&mbid={}", r.title, r.id), format!("{} - {}",    r.title,
-            r.artist_credit.unwrap()[0].name
-        ));
+        c.add_raw(format!("<a href=\"/add-final?name={1}&mbid={0}\" title=\"{1} - {2}\"><img src=\"/image?{0}\" alt=\"{1}\"></img></a>", r.id, r.title, get_artist(r.clone())));
         c.add_raw("<br>");
     }
 
@@ -166,15 +159,23 @@ async fn add_final(request: Request<hyper::body::Incoming>, sql: &SqlitePool)
 -> Result<Response<Full<Bytes>>, Infallible> {
     let query = FinalAddition::from_query(request.uri().query().unwrap()).unwrap();
 
-    sqlx::query("insert into album values(NULL, ?, ?);")
-        .bind(query.name)
-        .bind(query.mbid)
-        .execute(sql).await.unwrap();
-    
-    let val: Vec<(i32, String, String)> = sqlx::query_as("select * from album;")
+    let val: Vec<(String, String)> = sqlx::query_as("select * from album;")
         .fetch_all(sql).await.unwrap();
 
-    simple_page_response(format!("{:?}", val))
+    match sqlx::query("insert into album values(?, ?);")
+        .bind(query.mbid)
+        .bind(query.name)
+        .execute(sql).await {
+        Ok(_) => {
+            simple_page_response(format!("{:?}", val))
+        },
+        Err(_) => {
+            let res = simple_page_response(format!("{:?}", val));
+            let mut res = res.unwrap();
+                *res.status_mut() = StatusCode::BAD_REQUEST;
+            Ok(res)
+        }
+    }
 }
 
 async fn add(_request: Request<hyper::body::Incoming>) 
@@ -198,45 +199,101 @@ async fn add(_request: Request<hyper::body::Incoming>)
     ))
 }
  
-
-async fn hello(request: Request<hyper::body::Incoming>) 
+async fn image(request: Request<hyper::body::Incoming>)
 -> Result<Response<Full<Bytes>>, Infallible> {
+    let id = request.uri().query().unwrap();
+
+    std::fs::create_dir_all("cached_covers").unwrap();
+    Ok(Response::new(Full::new(
+        match std::fs::File::open(format!("cached_covers/{}", id)) {
+            Ok(mut f) => {
+                println!("reading from file");
+                let mut vec = Vec::new();
+                f.read_to_end(&mut vec).unwrap();
+                Bytes::from(vec)
+            },
+            Err(_) => {
+                println!("reading from site");
+                let cover_art = ReleaseGroup::fetch().id(id).execute().await.unwrap()
+                    .get_coverart().front().res_500().execute().await.unwrap();
+
+                let cover_art = match cover_art {
+                    musicbrainz_rs::entity::CoverartResponse::Json(c) => {
+                        c.images[0].image.clone()
+                    },
+                    musicbrainz_rs::entity::CoverartResponse::Url(url) => {
+                        url
+                    }
+                };
+
+                let response = reqwest::get(cover_art).await.unwrap().bytes().await.unwrap();
+                let mut f = std::fs::File::create(format!("cached_covers/{}", id)).unwrap();
+                f.write_all(&response).unwrap();
+                response
+            }
+        }
+    )))
+}
+
+async fn get_release_group(id: &String, release_map: &ReleaseMap)
+-> ReleaseGroup {
+    let mut map = release_map.lock().await; 
+    if map.contains_key(id) {
+        return map[id].clone()
+    } else {
+        let rg = ReleaseGroup::fetch().id(id.as_str()).with_artists().execute().await.unwrap();
+        map.insert(id.clone(), rg.clone()); 
+        rg
+    }
+}
+
+fn get_artist(r: ReleaseGroup) -> String {
+    match &r.artist_credit {
+        Some(v) => {
+            match v.get(0) {
+                Some(a) => {
+                    a.name.clone()
+                },
+                None => "Artist Unknown EmptyVec".to_string()
+            }
+        },
+        None => "Artist Unknown Credit".to_string()
+    }
+}
+
+async fn home(_request: Request<hyper::body::Incoming>, sql: &SqlitePool, release_map: &ReleaseMap) 
+-> Result<Response<Full<Bytes>>, Infallible> {
+    let val: Vec<(String, String)> = sqlx::query_as("select * from album;")
+        .fetch_all(sql).await.unwrap();
+    
+    let mut release_groups: Vec<ReleaseGroup> = Vec::new();
+    for i in val {
+        release_groups.push(get_release_group(&i.0, release_map).await);
+    }
+   
+    let mut c = Container::new(ContainerType::Div);
+
+    for r in release_groups {
+        c.add_raw(format!("<a href=\"/album?{0}\" title=\"{1} - {2}\"><img src=\"/image?{0}\" alt=\"{1}\"></img></a>", r.id, r.title, get_artist(r.clone())));
+       c.add_raw("<br>");
+    }
+
     Ok(Response::new(
-        Full::new(Bytes::from(
-            HtmlPage::new()
-                .with_title(format!("{}!", request.uri()))
-                .with_style(
-                     "p {
-                         color: blue;
-                     }"
-                )
+       Full::new(Bytes::from(
+           HtmlPage::new()
+                .with_title("simple page")
                 .with_container(
-                    Container::new(ContainerType::Div)
-                        .with_paragraph(format!("hello world, look {}", request.uri()))
+                    c
                 )
                 .to_html_string()
-        ))
+            )
+        )
     ))
 }
 
-async fn image(request: Request<hyper::body::Incoming>)
--> Result<Response<Full<Bytes>>, Infallible> {
-    let cover_art = ReleaseGroup::fetch().id(request.uri().query().unwrap()).execute().await.unwrap()
-        .get_coverart().execute().await.unwrap();
+type ReleaseMap = Arc<Mutex<BTreeMap<String, ReleaseGroup>>>;
 
-    let cover_art = match cover_art {
-        musicbrainz_rs::entity::CoverartResponse::Json(c) => {
-            c.images[0].image.clone()
-        },
-        musicbrainz_rs::entity::CoverartResponse::Url(url) => {
-            url
-        }
-    };
-
-    Ok(Response::new(Full::new(reqwest::get(cover_art).await.unwrap().bytes().await.unwrap())))
-}
-
-async fn router(request: Request<hyper::body::Incoming>, sql: &SqlitePool) 
+async fn router(request: Request<hyper::body::Incoming>, sql: &SqlitePool, release_map: &ReleaseMap) 
 -> Result<Response<Full<Bytes>>, Infallible> {
     let path: Vec<&str> = request.uri().path().split("/").collect();
     match path[1] {
@@ -244,7 +301,7 @@ async fn router(request: Request<hyper::body::Incoming>, sql: &SqlitePool)
         "mid-addition" => mid_addition(request).await,
         "add-final" => add_final(request, sql).await,
         "image" => image(request).await,
-        "hello" => hello(request).await,
+        "" => home(request, sql, release_map).await,
         _ => {
             let mut res = Response::new(Full::new(Bytes::from("")));
             *res.status_mut() = StatusCode::NOT_FOUND;
@@ -256,28 +313,22 @@ async fn router(request: Request<hyper::body::Incoming>, sql: &SqlitePool)
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-
-    // We create a TcpListener and bind it to 127.0.0.1:3000
     let listener = TcpListener::bind(addr).await?;
-
     let pool = SqlitePool::connect("db.db").await.unwrap();
 
-    // We start a loop to continuously accept incoming connections
+    let release_map = Arc::new(Mutex::new(BTreeMap::<String, ReleaseGroup>::new()));
+
     loop {
         let (stream, _) = listener.accept().await?;
 
-        // Use an adapter to access something implementing `tokio::io` traits as if they implement
-        // `hyper::rt` IO traits.
         let io = TokioIo::new(stream);
         let pool2 = pool.clone();
+        let release_map2 = release_map.clone();
 
-        // Spawn a tokio task to serve multiple connections concurrently
         tokio::task::spawn(async move {
-            // Finally, we bind the incoming connection to our `hello` service
             if let Err(err) = http1::Builder::new()
-                // `service_fn` converts our function in a `Service`
                 .serve_connection(io, service_fn(|request| {
-                    router(request, &pool2)
+                    router(request, &pool2, &release_map2)
                 }))
                 .await
             {
