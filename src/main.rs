@@ -124,6 +124,11 @@ fn simple_page_response(content: String) -> Result<Response<Full<Bytes>>, Infall
         ))
     ))
 }
+
+fn linked_album_image(rg: &ReleaseGroup) -> String {
+    format!("<a href=\"/album?{0}\" title=\"{1} - {2}\"><img src=\"/image?{0}\" alt=\"{1}\"></img></a>", rg.id, rg.title, get_artist(rg.clone()))
+}
+
 async fn mid_addition(request: Request<hyper::body::Incoming>) 
 -> Result<Response<Full<Bytes>>, Infallible> {
     let query = MidAdditionQuery::from_query(request.uri().query().unwrap()).unwrap();
@@ -132,8 +137,8 @@ async fn mid_addition(request: Request<hyper::body::Incoming>)
     ).execute().await.unwrap().entities;
 
     let mut c = Container::new(ContainerType::Div);
-    for r in result_iterator {
-        c.add_raw(format!("<a href=\"/add-final?name={1}&mbid={0}\" title=\"{1} - {2}\"><img src=\"/image?{0}\" alt=\"{1}\"></img></a>", r.id, r.title, get_artist(r.clone())));
+    for rg in result_iterator {
+        c.add_raw(format!("<a href=\"/add-final?name={1}&mbid={0}\" title=\"{1} - {2}\"><img src=\"/image?{0}\" alt=\"{1}\"></img></a>", rg.id, rg.title, get_artist(rg.clone())));
         c.add_raw("<br>");
     }
 
@@ -198,6 +203,36 @@ async fn add(_request: Request<hyper::body::Incoming>)
         ))
     ))
 }
+
+fn album_info(rg: ReleaseGroup) -> Container {
+    let mut genres_string = String::new();
+    println!("{:?}", rg);
+    let genres = rg.genres.clone().unwrap();
+    println!("{:?}", genres);
+    for i in genres {
+        genres_string.push_str(format!("{}, ", i.name).as_str());
+        println!("{}", i.name);
+    }
+
+    genres_string.pop();
+    genres_string.pop();
+
+    Container::new(ContainerType::Div)
+    .with_paragraph(format!("Title: {}", rg.title))
+    .with_paragraph(format!("Artist : {}", rg.clone().artist_credit.unwrap()[0].name))
+    .with_paragraph(format!("Genres: {}", genres_string))
+    .with_paragraph(format!("Debug Info: {:?}", rg))
+}
+
+async fn album(request: Request<hyper::body::Incoming>, release_map: &ReleaseMap)
+-> Result<Response<Full<Bytes>>, Infallible> {
+    let rg = get_release_group(&request.uri().query().unwrap().to_string(), release_map).await;
+
+    let mut c = Container::new(ContainerType::Div);
+    c.add_raw(linked_album_image(&rg));
+    c.add_container(album_info(rg.clone()));
+    Ok(Response::new(Full::new(Bytes::from(HtmlPage::new().with_container(c).to_html_string()))))
+}
  
 async fn image(request: Request<hyper::body::Incoming>)
 -> Result<Response<Full<Bytes>>, Infallible> {
@@ -241,7 +276,16 @@ async fn get_release_group(id: &String, release_map: &ReleaseMap)
     if map.contains_key(id) {
         return map[id].clone()
     } else {
-        let rg = ReleaseGroup::fetch().id(id.as_str()).with_artists().execute().await.unwrap();
+        let rg = ReleaseGroup::fetch().id(id.as_str())
+            .with_artists()
+            .with_tags()
+            .with_genres()
+            .with_aliases()
+            .with_ratings()
+            .with_releases()
+            .with_series_relations()
+            .with_release_group_relations()
+            .execute().await.unwrap();
         map.insert(id.clone(), rg.clone()); 
         rg
     }
@@ -301,6 +345,7 @@ async fn router(request: Request<hyper::body::Incoming>, sql: &SqlitePool, relea
         "mid-addition" => mid_addition(request).await,
         "add-final" => add_final(request, sql).await,
         "image" => image(request).await,
+        "album" => album(request, release_map).await,
         "" => home(request, sql, release_map).await,
         _ => {
             let mut res = Response::new(Full::new(Bytes::from("")));
