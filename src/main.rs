@@ -18,6 +18,12 @@ use musicbrainz_rs::prelude::*;
 use musicbrainz_rs::entity::release_group::*; 
 use sqlx::SqlitePool;
 
+type GeneralResponse = Result<Response<Full<Bytes>>, Infallible>;
+
+fn general_response(bytes: Bytes) -> GeneralResponse {
+    Ok(Response::new(Full::new(bytes)))
+}
+
 fn query_to_map(query: &str) -> BTreeMap<String, String> {
     let splits: Vec<&str> = query.split("&").collect();
     let mut map = BTreeMap::new();
@@ -45,6 +51,7 @@ trait Query {
 
 struct MidAdditionQuery {
     name: String,
+    artist: String,
     offset: i32,
 }
 
@@ -52,6 +59,7 @@ impl Query for MidAdditionQuery {
     fn to_tree(&self) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         map.insert("name".to_string(), self.name.clone());
+        map.insert("artist".to_string(), self.artist.clone());
         if self.offset != 0 {
             map.insert("offset".to_string(), self.offset.to_string());
         }
@@ -60,9 +68,9 @@ impl Query for MidAdditionQuery {
 
     fn to_string(&self) -> String {
         if self.offset == 0 {
-            format!("name={}", url_encode(&self.name))
+            url_encode(&format!("name={}&artist={}", self.name, self.artist))
         } else {
-            format!("name={}&offset={}", url_encode(&self.name), self.offset)
+            url_encode(&format!("name={}&artist={}&offset={}", self.name, self.artist, self.offset))
         }
     }
 
@@ -77,7 +85,9 @@ impl Query for MidAdditionQuery {
         
         Some(Self{
             name: url_decode(&map["name"]), 
-            offset: if map.contains_key("offset") {map["offset"].parse::<i32>().unwrap()} else {0}})
+            artist: url_decode(&map["artist"]),
+            offset: if map.contains_key("offset") {map["offset"].parse::<i32>().unwrap()} else {0}}
+        )
     }
 }
 
@@ -111,7 +121,7 @@ impl Query for FinalAddition {
     }
 }
 
-fn simple_page_response(content: String) -> Result<Response<Full<Bytes>>, Infallible> {
+fn simple_page_response(content: String) -> GeneralResponse {
     Ok(Response::new(
         Full::new(Bytes::from(
             HtmlPage::new()
@@ -129,50 +139,67 @@ fn linked_album_image(rg: &ReleaseGroup) -> String {
     format!("<a href=\"/album?{0}\" title=\"{1} - {2}\"><img src=\"/image?{0}\" alt=\"{1}\"></img></a>", rg.id, rg.title, get_artist(rg.clone()))
 }
 
+fn search_form(default_name: String, default_artist: String) -> Container {
+    Container::new(ContainerType::Div)
+             .with_raw(format!("
+             <form method=\"get\" action=\"/mid-addition\">
+                 <label for=\"name\">Album name</label>
+                 <input type=\"text\" id=\"name\" name=\"name\" value={0}><br>
+                 <label for=\"artist\" >Artist name</label>
+                 <input type=\"text\" id=\"artist\" name=\"artist\" value={1}><br>
+                 <input type=\"submit\" value=\"Submit\">
+             </form>
+             ", default_name, default_artist)
+    )
+}
+
 async fn mid_addition(request: Request<hyper::body::Incoming>) 
--> Result<Response<Full<Bytes>>, Infallible> {
+-> GeneralResponse {
     let query = MidAdditionQuery::from_query(request.uri().query().unwrap()).unwrap();
+
+    let mut mbquery = ReleaseGroupSearchQuery::query_builder();
+    if !query.name.is_empty() {mbquery.release_group(&query.name);}
+    if !query.artist.is_empty() {mbquery.artist(&query.artist);}
     let result_iterator: Vec<ReleaseGroup> = ReleaseGroup::search(
-        ReleaseGroupSearchQuery::query_builder().release_group(&query.name).build() + &format!("&offset={}", query.offset).to_string()
+        mbquery.build() + &format!("&offset={}", query.offset).to_string()
     ).execute().await.unwrap().entities;
 
     let mut c = Container::new(ContainerType::Div);
     for rg in result_iterator {
-        c.add_raw(format!("<a href=\"/add-final?name={1}&mbid={0}\" title=\"{1} - {2}\"><img src=\"/image?{0}\" alt=\"{1}\"></img></a>", rg.id, rg.title, get_artist(rg.clone())));
+        c.add_raw(format!("<a href=\"/add-final?name={1}&mbid={0}\" title=\"{1} - {2}\"><img src=\"/image?{0}\" alt=\"{1}\"></img></a>", rg.id, url_encode(&rg.title), url_encode(&get_artist(rg.clone()))));
         c.add_raw("<br>");
     }
 
     if query.offset != 0 {
-        c.add_link(format!("/mid-addition?name={}&offset={}", query.name, query.offset - 25), "Prev");
+        c.add_link(format!("/mid-addition?name={}&artist={}&offset={}", query.name, query.artist, query.offset - 25), "Prev");
     }
-    c.add_link(format!("/mid-addition?name={}&offset={}", query.name, query.offset + 25), "Next");
+    c.add_link(format!("/mid-addition?name={}&artist={}&offset={}", query.name, query.artist, query.offset + 25), "Next");
 
-    Ok(Response::new(
-       Full::new(Bytes::from(
-           HtmlPage::new()
-                .with_title("simple page")
-                .with_container(
-                    c
-                )
-                .to_html_string()
-            )
+    general_response(Bytes::from(
+       HtmlPage::new()
+            .with_title("simple page")
+            .with_container(search_form(query.name, query.artist))
+            .with_container(c)
+            .to_html_string()
         )
-    ))
+    )
 }
 
-async fn add_final(request: Request<hyper::body::Incoming>, sql: &SqlitePool) 
--> Result<Response<Full<Bytes>>, Infallible> {
+async fn add_final(request: Request<hyper::body::Incoming>, sql: &SqlitePool, release_map: &ReleaseMap) 
+-> GeneralResponse {
     let query = FinalAddition::from_query(request.uri().query().unwrap()).unwrap();
 
     let val: Vec<(String, String)> = sqlx::query_as("select * from album;")
         .fetch_all(sql).await.unwrap();
 
     match sqlx::query("insert into album values(?, ?);")
-        .bind(query.mbid)
+        .bind(query.mbid.clone())
         .bind(query.name)
         .execute(sql).await {
         Ok(_) => {
-            simple_page_response(format!("{:?}", val))
+            general_response(
+                Bytes::from(HtmlPage::new().with_container(album_page(&query.mbid.clone(), &release_map).await).to_html_string())
+            )
         },
         Err(_) => {
             let res = simple_page_response(format!("{:?}", val));
@@ -189,49 +216,71 @@ async fn add(_request: Request<hyper::body::Incoming>)
         Full::new(Bytes::from(
             HtmlPage::new()
                 .with_title("simple page")
-                .with_container(
-                    Container::new(ContainerType::Div)
-                    .with_raw("
-                    <form method=\"get\" action=\"/mid-addition\">
-                        <label for=\"name\">Album name</label><br>
-                        <input type=\"text\" id=\"name\" name=\"name\">
-                        <input type=\"submit\" value=\"Submit\">
-                    </form>
-                    ")
-                )
+                .with_container(search_form("".to_string(), "".to_string()))
                 .to_html_string()
         ))
     ))
 }
 
 fn album_info(rg: ReleaseGroup) -> Container {
-    let mut genres_string = String::new();
-    println!("{:?}", rg);
-    let genres = rg.genres.clone().unwrap();
-    println!("{:?}", genres);
-    for i in genres {
-        genres_string.push_str(format!("{}, ", i.name).as_str());
-        println!("{}", i.name);
-    }
-
-    genres_string.pop();
-    genres_string.pop();
-
     Container::new(ContainerType::Div)
     .with_paragraph(format!("Title: {}", rg.title))
     .with_paragraph(format!("Artist : {}", rg.clone().artist_credit.unwrap()[0].name))
-    .with_paragraph(format!("Genres: {}", genres_string))
-    .with_paragraph(format!("Debug Info: {:?}", rg))
+    .with_container(Container::new(ContainerType::Div).with_raw(format!("Debug Info: \n{}", serde_json::to_string_pretty(&rg).unwrap())))
 }
 
-async fn album(request: Request<hyper::body::Incoming>, release_map: &ReleaseMap)
--> Result<Response<Full<Bytes>>, Infallible> {
-    let rg = get_release_group(&request.uri().query().unwrap().to_string(), release_map).await;
+async fn album_page(id: &String, release_map: &ReleaseMap) -> Container {
+    let rg = get_release_group(id, release_map).await;
 
     let mut c = Container::new(ContainerType::Div);
     c.add_raw(linked_album_image(&rg));
     c.add_container(album_info(rg.clone()));
-    Ok(Response::new(Full::new(Bytes::from(HtmlPage::new().with_container(c).to_html_string()))))
+    c
+ 
+}
+
+async fn album(request: Request<hyper::body::Incoming>, release_map: &ReleaseMap)
+-> Result<Response<Full<Bytes>>, Infallible> {
+    let id = request.uri().query().unwrap();
+    Ok(Response::new(Full::new(Bytes::from(HtmlPage::new().with_container(album_page(&id.to_string(), release_map).await).to_html_string()))))
+}
+
+enum Resolution {
+    Res250, Res500, Res1200, Max
+}
+
+async fn image_url(id: &String, resolution: Resolution) -> String {
+    let mut fetch = ReleaseGroup::fetch().id(id).execute().await.unwrap().get_coverart();
+    let cover_art = match resolution {
+        Resolution::Max => {&mut fetch},
+        Resolution::Res250 => {fetch.res_250()},
+        Resolution::Res500=> {fetch.res_500()},
+        Resolution::Res1200 => {fetch.res_1200()},
+    }.execute().await.unwrap();
+    match cover_art {
+        musicbrainz_rs::entity::CoverartResponse::Json(c) => {
+            c.images[0].image.clone()
+        },
+        musicbrainz_rs::entity::CoverartResponse::Url(url) => {
+            url
+        }
+    }
+}
+
+async fn get_image(id: &String) -> Bytes {
+    match std::fs::File::open(format!("cached_covers/{}", id)) {
+        Ok(mut f) => {
+            let mut vec = Vec::new();
+            f.read_to_end(&mut vec).unwrap();
+            Bytes::from(vec)
+        },
+        Err(_) => {
+            let response = reqwest::get(image_url(&id, Resolution::Res500).await).await.unwrap().bytes().await.unwrap();
+            let mut f = std::fs::File::create(format!("cached_covers/{}", id)).unwrap();
+            f.write_all(&response).unwrap();
+            response
+        }
+    }
 }
  
 async fn image(request: Request<hyper::body::Incoming>)
@@ -239,35 +288,7 @@ async fn image(request: Request<hyper::body::Incoming>)
     let id = request.uri().query().unwrap();
 
     std::fs::create_dir_all("cached_covers").unwrap();
-    Ok(Response::new(Full::new(
-        match std::fs::File::open(format!("cached_covers/{}", id)) {
-            Ok(mut f) => {
-                println!("reading from file");
-                let mut vec = Vec::new();
-                f.read_to_end(&mut vec).unwrap();
-                Bytes::from(vec)
-            },
-            Err(_) => {
-                println!("reading from site");
-                let cover_art = ReleaseGroup::fetch().id(id).execute().await.unwrap()
-                    .get_coverart().front().res_500().execute().await.unwrap();
-
-                let cover_art = match cover_art {
-                    musicbrainz_rs::entity::CoverartResponse::Json(c) => {
-                        c.images[0].image.clone()
-                    },
-                    musicbrainz_rs::entity::CoverartResponse::Url(url) => {
-                        url
-                    }
-                };
-
-                let response = reqwest::get(cover_art).await.unwrap().bytes().await.unwrap();
-                let mut f = std::fs::File::create(format!("cached_covers/{}", id)).unwrap();
-                f.write_all(&response).unwrap();
-                response
-            }
-        }
-    )))
+    Ok(Response::new(Full::new(get_image(&id.to_string()).await)))
 }
 
 async fn get_release_group(id: &String, release_map: &ReleaseMap)
@@ -283,8 +304,6 @@ async fn get_release_group(id: &String, release_map: &ReleaseMap)
             .with_aliases()
             .with_ratings()
             .with_releases()
-            .with_series_relations()
-            .with_release_group_relations()
             .execute().await.unwrap();
         map.insert(id.clone(), rg.clone()); 
         rg
@@ -343,7 +362,7 @@ async fn router(request: Request<hyper::body::Incoming>, sql: &SqlitePool, relea
     match path[1] {
         "add" => add(request).await,
         "mid-addition" => mid_addition(request).await,
-        "add-final" => add_final(request, sql).await,
+        "add-final" => add_final(request, sql, release_map).await,
         "image" => image(request).await,
         "album" => album(request, release_map).await,
         "" => home(request, sql, release_map).await,
@@ -357,7 +376,7 @@ async fn router(request: Request<hyper::body::Incoming>, sql: &SqlitePool, relea
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     let listener = TcpListener::bind(addr).await?;
     let pool = SqlitePool::connect("db.db").await.unwrap();
 
